@@ -1,4 +1,5 @@
 import https from 'https';
+import { YoutubeTranscript } from 'youtube-transcript';
 
 interface TranscriptLine {
   text: string;
@@ -27,106 +28,40 @@ export interface VideoMetadata {
 }
 
 interface PageData {
-  visitorData: string;
-  clientVersion: string;
   availableLanguages: CaptionTrack[];
   adChapters: AdChapter[];
   metadata: VideoMetadata;
 }
 
 const REQUEST_TIMEOUT = 30000; // 30 seconds
-
-// TODO: These versions may need periodic updates if YouTube starts rejecting old clients
-// The ANDROID client is used to bypass YouTube's poToken A/B test enforcement
-const ANDROID_CLIENT_VERSION = '19.29.37';
-const ANDROID_USER_AGENT = `com.google.android.youtube/${ANDROID_CLIENT_VERSION} (Linux; U; Android 11) gzip`;
-const WEB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const DEFAULT_CLIENT_VERSION = '2.20251201.01.00'; // Fallback if not extracted from page
-
-/**
- * Encodes a number as a protobuf varint
- * Handles lengths > 127 correctly (multi-byte encoding)
- */
-function encodeVarint(value: number): number[] {
-  const bytes: number[] = [];
-  while (value > 0x7f) {
-    bytes.push((value & 0x7f) | 0x80);
-    value >>>= 7;
-  }
-  bytes.push(value);
-  return bytes;
-}
-
-/**
- * Builds the protobuf-encoded params for the transcript API
- */
-function buildParams(videoId: string, lang: string = 'en'): string {
-  // Inner protobuf: language params
-  // Field 1: "asr" (auto speech recognition)
-  // Field 2: language code
-  // Field 3: empty string
-  const innerParts: number[] = [
-    0x0a, 0x03, ...Buffer.from('asr'),           // Field 1, "asr"
-    0x12, ...encodeVarint(lang.length), ...Buffer.from(lang),  // Field 2, language code
-    0x1a, 0x00                                    // Field 3, empty
-  ];
-  const innerBuf = Buffer.from(innerParts);
-  const innerB64 = innerBuf.toString('base64');
-  const innerEncoded = encodeURIComponent(innerB64);
-
-  // Outer protobuf
-  const panelName = 'engagement-panel-searchable-transcript-search-panel';
-  const outerParts: number[] = [
-    0x0a, ...encodeVarint(videoId.length), ...Buffer.from(videoId),      // Field 1, video ID
-    0x12, ...encodeVarint(innerEncoded.length), ...Buffer.from(innerEncoded), // Field 2, language params
-    0x18, 0x01,                                          // Field 3, value 1
-    0x2a, ...encodeVarint(panelName.length), ...Buffer.from(panelName),  // Field 5, panel name
-    0x30, 0x01,                                          // Field 6, value 1
-    0x38, 0x01,                                          // Field 7, value 1
-    0x40, 0x01                                           // Field 8, value 1
-  ];
-
-  return Buffer.from(outerParts).toString('base64');
-}
+const WEB_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 /**
  * Makes an HTTPS request and returns the response body
- * Includes timeout and HTTP status code validation
  */
 function httpsRequest(options: https.RequestOptions, data?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const req = https.request({ ...options, timeout: REQUEST_TIMEOUT }, (res) => {
-      // Validate HTTP status code
       if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
         reject(new Error(`HTTP ${res.statusCode}: ${res.statusMessage || 'Unknown error'}`));
         return;
       }
-
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => resolve(body));
     });
-
-    req.on('error', (err) => {
-      reject(new Error(`Network error: ${err.message}`));
-    });
-
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error(`Request timeout after ${REQUEST_TIMEOUT}ms`));
-    });
-
+    req.on('error', (err) => reject(new Error(`Network error: ${err.message}`)));
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Request timeout after ${REQUEST_TIMEOUT}ms`)); });
     if (data) req.write(data);
     req.end();
   });
 }
 
 /**
- * Fetches the YouTube video page and extracts visitor data and client version
+ * Fetches the YouTube video page and extracts metadata, languages, and ad chapters
  */
 async function getPageData(videoId: string): Promise<PageData> {
   let html: string;
-
   try {
     html = await httpsRequest({
       hostname: 'www.youtube.com',
@@ -140,18 +75,6 @@ async function getPageData(videoId: string): Promise<PageData> {
   } catch (err) {
     throw new Error(`Failed to fetch video page: ${(err as Error).message}`);
   }
-
-  // Extract visitor data
-  const visitorMatch = html.match(/"visitorData":"([^"]+)"/);
-  const visitorData = visitorMatch?.[1] || '';
-
-  if (!visitorData) {
-    console.error(`[youtube-fetcher] Warning: Could not extract visitorData for video ${videoId}. Request may fail.`);
-  }
-
-  // Extract client version (format: "2.YYYYMMDD.XX.XX")
-  const versionMatch = html.match(/"clientVersion":"([\d.]+)"/);
-  const clientVersion = versionMatch?.[1] || DEFAULT_CLIENT_VERSION;
 
   // Extract available caption tracks
   const availableLanguages: CaptionTrack[] = [];
@@ -182,55 +105,34 @@ async function getPageData(videoId: string): Promise<PageData> {
     '[promo]', '[promotion]', '[anzeige]', '[reklame]'
   ];
 
-  // Extract chapters from chapterRenderer elements
   const chapterMatches = [...html.matchAll(/"chapterRenderer":\s*\{[^}]*"title":\s*\{\s*"simpleText":\s*"([^"]+)"[^}]*\}[^}]*"timeRangeStartMillis":\s*"?(\d+)"?/g)];
 
-  interface Chapter {
-    title: string;
-    startMs: number;
-    isAd: boolean;
-  }
-
+  interface Chapter { title: string; startMs: number; isAd: boolean; }
   const chapters: Chapter[] = chapterMatches.map(match => ({
     title: match[1],
     startMs: parseInt(match[2], 10),
     isAd: adMarkers.some(marker => match[1].toLowerCase().includes(marker))
   }));
 
-  // Convert ad chapters to AdChapter format with end times
   for (let i = 0; i < chapters.length; i++) {
     if (chapters[i].isAd) {
       const nextChapter = chapters[i + 1];
-      // End time is start of next chapter, or +5 minutes if last chapter
       const endMs = nextChapter ? nextChapter.startMs : chapters[i].startMs + 300000;
-      adChapters.push({
-        title: chapters[i].title,
-        startMs: chapters[i].startMs,
-        endMs: endMs
-      });
+      adChapters.push({ title: chapters[i].title, startMs: chapters[i].startMs, endMs });
     }
   }
 
-  // Extract video metadata (target videoDetails block, use .*? for nested objects)
+  // Extract video metadata
   const titleMatch = html.match(/"videoDetails":\{.*?"title":"([^"]+)"/);
   const authorMatch = html.match(/"videoDetails":\{.*?"author":"([^"]+)"/);
   const subsMatch = html.match(/"subscriberCountText":\{"accessibility":\{"accessibilityData":\{"label":"([^"]+)"/);
   const viewsMatch = html.match(/"viewCount":"(\d+)"/);
   const dateMatch = html.match(/"publishDate":"([^"]+)"/);
 
-  // Shorten subscriber count: "649 thousand subscribers" → "649k"
-  let subs = subsMatch?.[1] || '';
-  subs = subs.replace(/ subscribers?/i, '').replace(/ thousand/i, 'k').replace(/ million/i, 'M').replace(/ billion/i, 'B');
-
-  // Format view count: 22205 → "22.2k" (explicit NaN handling)
+  let subs = (subsMatch?.[1] || '').replace(/ subscribers?/i, '').replace(/ thousand/i, 'k').replace(/ million/i, 'M').replace(/ billion/i, 'B');
   const views = viewsMatch?.[1] || '';
   const viewNum = parseInt(views, 10);
-  const viewsFormatted = Number.isNaN(viewNum) ? ''
-    : viewNum >= 1_000_000 ? (viewNum / 1_000_000).toFixed(1) + 'M'
-    : viewNum >= 1_000 ? (viewNum / 1_000).toFixed(1) + 'k'
-    : views;
-
-  // Shorten date: "2025-12-03T03:01:16-08:00" → "2025-12-03"
+  const viewsFormatted = Number.isNaN(viewNum) ? '' : viewNum >= 1_000_000 ? (viewNum / 1_000_000).toFixed(1) + 'M' : viewNum >= 1_000 ? (viewNum / 1_000).toFixed(1) + 'k' : views;
   const dateRaw = dateMatch?.[1] || '';
   const dateShort = dateRaw.split('T')[0];
 
@@ -242,7 +144,7 @@ async function getPageData(videoId: string): Promise<PageData> {
     publishDate: dateShort
   };
 
-  return { visitorData, clientVersion, availableLanguages, adChapters, metadata };
+  return { availableLanguages, adChapters, metadata };
 }
 
 export interface SubtitleResult {
@@ -266,9 +168,8 @@ export async function getAvailableLanguages(videoID: string): Promise<CaptionTra
 }
 
 /**
- * Fetches transcript using the YouTube internal API
- * If the requested language is not available and enableFallback is true,
- * it will try English first, then fall back to the first available language.
+ * Fetches transcript using the youtube-transcript package (uses timedtext API).
+ * Falls back to available languages if the requested language is not available.
  */
 export async function getSubtitles(options: {
   videoID: string;
@@ -277,120 +178,46 @@ export async function getSubtitles(options: {
 }): Promise<SubtitleResult> {
   const { videoID, lang = 'en', enableFallback = true } = options;
 
-  // Validate video ID format
   if (!videoID || typeof videoID !== 'string') {
     throw new Error('Invalid video ID: must be a non-empty string');
   }
 
-  // Get page data (visitor data needed for API authentication)
-  const { visitorData, availableLanguages, adChapters, metadata } = await getPageData(videoID);
+  // Get page data for metadata, languages, and ad chapters
+  const { availableLanguages, adChapters, metadata } = await getPageData(videoID);
 
   // Determine which language to use
   let targetLang = lang;
-
   if (availableLanguages.length > 0) {
     const hasRequestedLang = availableLanguages.some(t => t.languageCode === lang);
-
     if (!hasRequestedLang && enableFallback) {
-      // Try English first
       const hasEnglish = availableLanguages.some(t => t.languageCode === 'en');
-      if (hasEnglish) {
-        targetLang = 'en';
-        console.error(`[youtube-fetcher] Language '${lang}' not available, falling back to 'en'`);
-      } else {
-        // Use first available
-        targetLang = availableLanguages[0].languageCode;
-        console.error(`[youtube-fetcher] Language '${lang}' not available, falling back to '${targetLang}'`);
-      }
+      targetLang = hasEnglish ? 'en' : (availableLanguages[0]?.languageCode || lang);
+      console.error(`[youtube-fetcher] Language '${lang}' not available, falling back to '${targetLang}'`);
     } else if (!hasRequestedLang) {
       throw new Error(`Language '${lang}' not available. Available: ${availableLanguages.map(t => t.languageCode).join(', ')}`);
     }
   }
 
-  // Build request payload using ANDROID client to avoid FAILED_PRECONDITION errors
-  // The ANDROID client bypasses YouTube's A/B test for poToken enforcement
-  const params = buildParams(videoID, targetLang);
-  const payload = JSON.stringify({
-    context: {
-      client: {
-        hl: targetLang,
-        gl: 'US',
-        clientName: 'ANDROID',
-        clientVersion: ANDROID_CLIENT_VERSION,
-        androidSdkVersion: 30,
-        visitorData: visitorData
-      }
-    },
-    params: params
-  });
-
-  // Make API request
-  let response: string;
+  // Fetch transcript using youtube-transcript package
+  let rawLines: { text: string; offset: number; duration: number }[];
   try {
-    response = await httpsRequest({
-      hostname: 'www.youtube.com',
-      path: '/youtubei/v1/get_transcript?prettyPrint=false',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        'User-Agent': ANDROID_USER_AGENT,
-        'Origin': 'https://www.youtube.com'
-      }
-    }, payload);
+    rawLines = await YoutubeTranscript.fetchTranscript(videoID, { lang: targetLang });
   } catch (err) {
-    throw new Error(`Failed to fetch transcript API: ${(err as Error).message}`);
-  }
-
-  // Parse response with error handling
-  let json: any;
-  try {
-    json = JSON.parse(response);
-  } catch (err) {
-    throw new Error(`Failed to parse YouTube API response: ${(err as Error).message}. Response preview: ${response.substring(0, 200)}`);
-  }
-
-  // Check for API-level errors
-  if (json.error) {
-    const errorMsg = json.error.message || json.error.code || 'Unknown API error';
-    throw new Error(`YouTube API error: ${errorMsg}`);
-  }
-
-  // Extract transcript segments - handle both WEB and ANDROID response formats
-  const webSegments = json?.actions?.[0]?.updateEngagementPanelAction?.content
-    ?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body
-    ?.transcriptSegmentListRenderer?.initialSegments;
-
-  const androidSegments = json?.actions?.[0]?.elementsCommand?.transformEntityCommand
-    ?.arguments?.transformTranscriptSegmentListArguments?.overwrite?.initialSegments;
-
-  const segments = webSegments || androidSegments || [];
-
-  if (segments.length === 0) {
-    throw new Error('No transcript available for this video. The video may not have captions enabled.');
+    throw new Error(`Failed to fetch transcript: ${(err as Error).message}. The video may not have captions in '${targetLang}'.`);
   }
 
   // Convert to TranscriptLine format
-  const lines = segments
-    .filter((seg: any) => seg?.transcriptSegmentRenderer) // Skip section headers
-    .map((seg: any) => {
-      const renderer = seg.transcriptSegmentRenderer;
+  const lines: TranscriptLine[] = rawLines
+    .map(l => ({
+      text: l.text,
+      start: l.offset / 1000,
+      dur: l.duration / 1000
+    }))
+    .filter(l => l.text.trim().length > 0);
 
-      // Handle both WEB format (snippet.runs) and ANDROID format (snippet.elementsAttributedString)
-      const webText = renderer?.snippet?.runs?.map((r: any) => r.text || '').join('');
-      const androidText = renderer?.snippet?.elementsAttributedString?.content;
-      const text = webText || androidText || '';
-
-      const startMs = parseInt(renderer?.startMs || '0', 10);
-      const endMs = parseInt(renderer?.endMs || '0', 10);
-
-      return {
-        text: text,
-        start: startMs / 1000,
-        dur: (endMs - startMs) / 1000
-      };
-    })
-    .filter((line: TranscriptLine) => line.text.length > 0);
+  if (lines.length === 0) {
+    throw new Error('No transcript available for this video. The video may not have captions enabled.');
+  }
 
   return {
     lines,
